@@ -1,0 +1,276 @@
+# ============================================================
+# ISEYAA — Docker Compose (Local Development)
+# ============================================================
+# Usage:
+#   docker compose up -d                   # Start all services
+#   docker compose up api-gateway events-service  # Start specific
+#   docker compose logs -f wallet-service  # Tail logs
+#   docker compose down -v                 # Destroy + volumes
+# ============================================================
+
+networks:
+  iseyaa-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  postgres_wallet_data:
+  redis_data:
+  mongodb_data:
+  clickhouse_data:
+
+x-service-defaults: &service-defaults
+  restart: unless-stopped
+  networks:
+    - iseyaa-network
+  env_file:
+    - .env
+
+# ── Infrastructure ────────────────────────────────────────────────────────────
+
+services:
+
+  postgres:
+    <<: *service-defaults
+    image: postgres:16-alpine
+    container_name: iseyaa-postgres
+    environment:
+      POSTGRES_USER: iseyaa_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-iseyaa_dev_password}
+      POSTGRES_DB: iseyaa_db
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=en_US.UTF-8"
+    ports:
+      - "5442:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/sql/init.sql:/docker-entrypoint-initdb.d/01_init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U iseyaa_user -d iseyaa_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres-wallet:
+    <<: *service-defaults
+    image: postgres:16-alpine
+    container_name: iseyaa-postgres-wallet
+    environment:
+      POSTGRES_USER: iseyaa_wallet
+      POSTGRES_PASSWORD: ${WALLET_POSTGRES_PASSWORD:-wallet_dev_password}
+      POSTGRES_DB: iseyaa_wallet_db
+    ports:
+      - "5443:5432"
+    volumes:
+      - postgres_wallet_data:/var/lib/postgresql/data
+      - ./scripts/sql/wallet_init.sql:/docker-entrypoint-initdb.d/01_wallet_init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U iseyaa_wallet -d iseyaa_wallet_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    <<: *service-defaults
+    image: redis:7-alpine
+    container_name: iseyaa-redis
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  mongodb:
+    <<: *service-defaults
+    image: mongo:7
+    container_name: iseyaa-mongodb
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: iseyaa_mongo
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:-mongo_dev_password}
+      MONGO_INITDB_DATABASE: iseyaa_content
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+
+  clickhouse:
+    <<: *service-defaults
+    image: clickhouse/clickhouse-server:24-alpine
+    container_name: iseyaa-clickhouse
+    ports:
+      - "8123:8123"   # HTTP interface
+      - "9000:9000"   # Native protocol
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./scripts/sql/clickhouse_init.sql:/docker-entrypoint-initdb.d/01_init.sql
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+  # ── Application Services ────────────────────────────────────────────────────
+
+  api-gateway:
+    <<: *service-defaults
+    build:
+      context: ./api-gateway
+      dockerfile: Dockerfile
+      target: development
+    container_name: iseyaa-api-gateway
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./api-gateway:/app
+    environment:
+      - AUTH_SERVICE_URL=http://auth-service:8001
+      - WALLET_SERVICE_URL=http://wallet-service:8002
+      - EVENTS_SERVICE_URL=http://events-service:8003
+      - LGA_INTELLIGENCE_SERVICE_URL=http://lga-intelligence-service:8004
+      - NOTIFICATIONS_SERVICE_URL=http://notifications-service:8005
+      - AI_LAYER_URL=http://ai-layer:8010
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --log-level info
+
+  auth-service:
+    <<: *service-defaults
+    build:
+      context: ./services/auth-service
+      dockerfile: Dockerfile
+    container_name: iseyaa-auth-service
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./services/auth-service:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload
+
+  wallet-service:
+    <<: *service-defaults
+    build:
+      context: ./services/wallet-service
+      dockerfile: Dockerfile
+    container_name: iseyaa-wallet-service
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./services/wallet-service:/app
+    depends_on:
+      postgres-wallet:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8002 --reload
+
+  events-service:
+    <<: *service-defaults
+    build:
+      context: ./services/events-service
+      dockerfile: Dockerfile
+    container_name: iseyaa-events-service
+    ports:
+      - "8003:8003"
+    volumes:
+      - ./services/events-service:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mongodb:
+        condition: service_started
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8003 --reload
+
+  lga-intelligence-service:
+    <<: *service-defaults
+    build:
+      context: ./services/lga-intelligence-service
+      dockerfile: Dockerfile
+    container_name: iseyaa-lga-intelligence
+    ports:
+      - "8004:8004"
+    volumes:
+      - ./services/lga-intelligence-service:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_started
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8004 --reload
+
+  notifications-service:
+    <<: *service-defaults
+    build:
+      context: ./services/notifications-service
+      dockerfile: Dockerfile
+    container_name: iseyaa-notifications-service
+    ports:
+      - "8005:8005"
+    volumes:
+      - ./services/notifications-service:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8005 --reload
+
+  ai-layer:
+    <<: *service-defaults
+    build:
+      context: ./ai-layer
+      dockerfile: Dockerfile
+    container_name: iseyaa-ai-layer
+    ports:
+      - "8010:8010"
+    volumes:
+      - ./ai-layer:/app
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8010 --reload
+
+  # ── Frontend (Dev) ──────────────────────────────────────────────────────────
+
+  web:
+    <<: *service-defaults
+    build:
+      context: ./frontend/web
+      dockerfile: Dockerfile.dev
+    container_name: iseyaa-web
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend/web:/app
+      - /app/node_modules
+      - /app/.next
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - NODE_ENV=development
+    command: npm run dev
+
+  # ── Observability ───────────────────────────────────────────────────────────
+
+  otel-collector:
+    <<: *service-defaults
+    image: otel/opentelemetry-collector:0.96.0
+    container_name: iseyaa-otel
+    ports:
+      - "4317:4317"   # gRPC
+      - "4318:4318"   # HTTP
+    volumes:
+      - ./infrastructure/docker/otel-config.yaml:/etc/otel-collector-config.yaml
+    command: ["--config=/etc/otel-collector-config.yaml"]

@@ -1,0 +1,77 @@
+# ============================================================
+# ISEYAA — .gitignore
+# ============================================================
+
+# NEVER commit — secrets
+.env
+.env.local
+.env.production
+.env.staging
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+env/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+
+# Node / Next.js
+node_modules/
+.next/
+*.log
+npm-debug.log*
+
+# React Native / Expo
+.expo/
+ios/
+android/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars
+.terraform.lock.hcl
+
+# AWS / GCP credentials
+*.pem
+.aws/
+gcp-service-account.json
+
+# Docker volumes
+*.tar
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# macOS metadata (never commit these)
+__MACOSX/
+._*
+
+# Logs
+logs/
+*.log
+
+# Test output
+coverage/
+junit.xml
+
+# Alembic generated (don't ignore versions — commit them)
+# alembic.ini is committed (no secrets in it)
+
+# Documentation output (compiled)
+docs/_build/
