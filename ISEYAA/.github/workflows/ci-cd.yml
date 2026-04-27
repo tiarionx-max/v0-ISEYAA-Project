@@ -1,0 +1,238 @@
+# ============================================================
+# ISEYAA — GitHub Actions CI/CD Pipeline
+# Triggers: Push to main, Pull Requests
+# PRD Reference: §5.9 DevOps, CI/CD & Observability
+# ============================================================
+
+name: ISEYAA CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: af-south-1
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.af-south-1.amazonaws.com
+
+jobs:
+
+  # ── Lint & Type Check ───────────────────────────────────────────────────────
+  lint:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [api-gateway, services/auth-service, services/wallet-service,
+                  services/events-service, services/lga-intelligence-service,
+                  services/notifications-service, ai-layer]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install lint tools
+        run: pip install ruff mypy
+
+      - name: Ruff lint
+        run: ruff check ${{ matrix.service }}/
+
+      - name: Type check
+        run: mypy ${{ matrix.service }}/app --ignore-missing-imports
+        continue-on-error: true   # Warn, don't block in Sprint 1
+
+  # ── Security Scan ───────────────────────────────────────────────────────────
+  security:
+    name: Security Scan (Snyk)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: snyk/actions/python@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high --all-projects
+        continue-on-error: false  # Block on HIGH/CRITICAL CVEs (PRD §5.9)
+
+  # ── Unit Tests ──────────────────────────────────────────────────────────────
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: [lint]
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: iseyaa_test
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: --health-cmd "redis-cli ping" --health-interval 10s --health-timeout 5s --health-retries 5
+
+    strategy:
+      matrix:
+        service: [api-gateway, services/wallet-service, services/events-service,
+                  services/lga-intelligence-service, ai-layer]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          cd ${{ matrix.service }}
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio pytest-cov httpx
+
+      - name: Run tests
+        env:
+          DATABASE_URL: postgresql+asyncpg://test_user:test_password@localhost:5432/iseyaa_test
+          REDIS_URL: redis://localhost:6379/0
+          JWT_SECRET_KEY: test-secret-key-minimum-32-characters
+          SECRET_KEY: test-secret-key
+          ENVIRONMENT: test
+        run: |
+          cd ${{ matrix.service }}
+          pytest tests/ -v --cov=app --cov-report=xml --cov-fail-under=70
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          file: ${{ matrix.service }}/coverage.xml
+
+  # ── Build & Push Docker Images ──────────────────────────────────────────────
+  build:
+    name: Build Docker Images
+    runs-on: ubuntu-latest
+    needs: [test, security]
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+
+    strategy:
+      matrix:
+        service:
+          - name: api-gateway
+            path: api-gateway
+          - name: auth-service
+            path: services/auth-service
+          - name: wallet-service
+            path: services/wallet-service
+          - name: events-service
+            path: services/events-service
+          - name: lga-intelligence-service
+            path: services/lga-intelligence-service
+          - name: notifications-service
+            path: services/notifications-service
+          - name: ai-layer
+            path: ai-layer
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+          SERVICE:   ${{ matrix.service.name }}
+          PATH:      ${{ matrix.service.path }}
+        run: |
+          IMAGE_URI=$ECR_REGISTRY/iseyaa-$SERVICE
+          docker build \
+            --target production \
+            --cache-from $IMAGE_URI:latest \
+            --tag $IMAGE_URI:$IMAGE_TAG \
+            --tag $IMAGE_URI:latest \
+            $PATH/
+          docker push $IMAGE_URI:$IMAGE_TAG
+          docker push $IMAGE_URI:latest
+
+  # ── Deploy to Dev EKS ────────────────────────────────────────────────────────
+  deploy-dev:
+    name: Deploy to Dev (EKS)
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: github.ref == 'refs/heads/develop'
+    environment: development
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name iseyaa-eks-development --region ${{ env.AWS_REGION }}
+
+      - name: Deploy via ArgoCD
+        run: |
+          # ArgoCD syncs from Git — update image tags in overlay
+          cd infrastructure/k8s/overlays/dev
+          kustomize edit set image \
+            api-gateway=$ECR_REGISTRY/iseyaa-api-gateway:${{ github.sha }} \
+            wallet-service=$ECR_REGISTRY/iseyaa-wallet-service:${{ github.sha }} \
+            events-service=$ECR_REGISTRY/iseyaa-events-service:${{ github.sha }}
+          git config user.email "ci@iseyaa.og.gov.ng"
+          git config user.name "ISEYAA CI"
+          git add . && git commit -m "ci: deploy ${{ github.sha }} to dev" || echo "No changes"
+          git push
+
+  # ── Deploy to Production (manual approval) ──────────────────────────────────
+  deploy-prod:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://iseyaa.og.gov.ng
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (production)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.PROD_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.PROD_AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+          role-to-assume:        ${{ secrets.PROD_DEPLOY_ROLE_ARN }}
+
+      - name: Update kubeconfig (prod)
+        run: aws eks update-kubeconfig --name iseyaa-eks-production --region ${{ env.AWS_REGION }}
+
+      - name: Deploy via ArgoCD (prod)
+        run: |
+          cd infrastructure/k8s/overlays/prod
+          kustomize edit set image \
+            api-gateway=$ECR_REGISTRY/iseyaa-api-gateway:${{ github.sha }}
+          git add . && git commit -m "ci: deploy ${{ github.sha }} to production" || echo "No changes"
+          git push
+
+      - name: Notify Datadog deployment
+        run: |
+          curl -X POST "https://api.datadoghq.com/api/v1/events" \
+            -H "DD-API-KEY: ${{ secrets.DATADOG_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{"title":"ISEYAA Production Deployment","text":"Deployed ${{ github.sha }}","tags":["env:production","service:iseyaa"]}'
